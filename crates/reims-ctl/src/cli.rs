@@ -108,7 +108,7 @@ pub enum Cmd {
     },
     /// List the GPUs a VM can be given (Linux and Windows)
     Gpus,
-    /// List this host's USB devices, and give a VM some or take them back (Linux)
+    /// List this host's USB devices, and give a VM some or take them back (Linux and Windows)
     #[command(after_help = usb_help())]
     Usb {
         /// The VM whose devices to show or change (without one, this host's devices)
@@ -248,8 +248,37 @@ OpenCore's picker, is carried over unless --boot-selection gives it; hidden, Ope
 macOS's startup disk at once. Whatever else was changed in the old image is not carried over. The \
 VM must be stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
 
-/// `usb --help`'s account of passthrough, with the udev rule the install adds.
+/// `usb --help`'s account of passthrough, with the udev rule the install adds on Linux and the
+/// driver QEMU needs on Windows.
 fn usb_help() -> String {
+    usb_help_on(Host::current())
+}
+
+/// `usb --help` on `host`: the account of devices is the same on every host; how QEMU opens one
+/// differs.
+fn usb_help_on(host: Host) -> String {
+    let access = match host.os {
+        crate::host::Os::Windows => "\
+On Windows, reims-ctl lists this host's devices with libusb, other than hubs, and QEMU's usb-host \
+opens one through WinUSB: switch each device's driver to WinUSB with Zadig \
+(https://zadig.akeo.ie/) before giving it to a VM. Only a device whose driver is WinUSB can be \
+opened; libusbK and libusb-win32 are not enough. reims-ctl doctor names the devices it cannot \
+open; a device's port in the list is libusb's location on the bus."
+            .to_string(),
+        _ => format!(
+            "\
+QEMU opens the device's file in /dev/bus/usb, which only root may write unless a udev rule \
+says otherwise. scripts/install-ctl.sh, which reims-ctl update runs, adds {file}, which gives \
+USB devices other than hubs to the kvm group and to the user at this host's screen:
+
+  {rule}
+
+Over SSH, without a session at the screen, you need to be in the kvm group (sudo usermod -aG \
+kvm $USER, then log in again).",
+            file = crate::usb::UDEV_RULE_FILE,
+            rule = crate::usb::UDEV_RULE,
+        ),
+    };
     format!(
         "\
 DEVICE is a device's number in the list, its ID (1050:0407), its port (3-2.1) or a word of its \
@@ -266,17 +295,8 @@ has two devices with the same IDs, the one you give is known by its port too, an
 only in that port. A device that isn't plugged in joins the guest when it is, and one unplugged \
 comes back when it is plugged in again.
 
-QEMU opens the device's file in /dev/bus/usb, which only root may write unless a udev rule \
-says otherwise. scripts/install-ctl.sh, which reims-ctl update runs, adds {file}, which gives \
-USB devices other than hubs to the kvm group and to the user at this host's screen:
-
-  {rule}
-
-Over SSH, without a session at the screen, you need to be in the kvm group (sudo usermod -aG \
-kvm $USER, then log in again).",
+{access}",
         max = vm::USB_DEVICES_MAX,
-        file = crate::usb::UDEV_RULE_FILE,
-        rule = crate::usb::UDEV_RULE,
     )
 }
 
@@ -1520,14 +1540,25 @@ pub const CROSSING: &str = "If your screen is plugged into a different GPU than 
                             link: an RTX 3090 in a PCIe 3.0 x4 slot spends about 16 ms a frame \
                             on it at 3648 x 2039.";
 
-/// `doctor`'s USB passthrough check, on Linux: QEMU's usb-host, and the devices this user may
-/// open, which fail the check only where a VM is given USB devices.
-fn usb_check(profile: Profile) -> (bool, String) {
+/// `doctor`'s USB passthrough check: QEMU's usb-host, and the devices this user may open, which
+/// fail the check only where a VM is given USB devices. libusb lists the devices on every host,
+/// but what opens them differs: Linux's device files, which the install's udev rule makes
+/// writable, and Windows' WinUSB drivers, which Zadig switches.
+fn usb_check(host: Host, profile: Profile) -> (bool, String) {
+    if let Err(why) = crate::usb::available(host) {
+        return (true, why.to_string());
+    }
     let devices = crate::usb::host_devices();
     let closed: Vec<String> = devices
         .iter()
         .filter(|d| !d.usable())
-        .map(|d| d.file().display().to_string())
+        .map(|d| {
+            if host.os == crate::host::Os::Windows {
+                d.id()
+            } else {
+                d.file().display().to_string()
+            }
+        })
         .collect();
     let used = Registry::load().is_ok_and(|reg| {
         reg.vms
@@ -1556,17 +1587,40 @@ fn usb_check(profile: Profile) -> (bool, String) {
             ),
         )
     } else {
-        (
-            !used,
-            format!(
-                "you can't open {} of the {} plugged in ({}): {}",
-                closed.len(),
-                plural(devices.len(), "device"),
-                closed.join(", "),
-                crate::usb::fix()
-            ),
-        )
+        usb_unopenable(host, devices.len(), &closed, used, &crate::usb::fix())
     }
+}
+
+/// `doctor`'s answer to `closed` devices it cannot open, of `count` plugged in. `fix` is the
+/// usb module's account of the Linux udev rule; on Windows libusb needs a WinUSB driver for each
+/// device instead, which QEMU cannot do for it.
+fn usb_unopenable(
+    host: Host,
+    count: usize,
+    closed: &[String],
+    used: bool,
+    fix: &str,
+) -> (bool, String) {
+    let why = match host.os {
+        crate::host::Os::Windows => {
+            // libusb opens a device on Windows through WinUSB; Zadig installs that driver for one
+            // device at a time, which is what a user must do before QEMU can take it.
+            "libusb opens devices on Windows through WinUSB: switch each device's driver with \
+             Zadig (https://zadig.akeo.ie/)"
+                .to_string()
+        }
+        _ => fix.to_string(),
+    };
+    (
+        !used,
+        format!(
+            "you can't open {} of the {} plugged in ({}): {}",
+            closed.len(),
+            plural(count, "device"),
+            closed.join(", "),
+            why
+        ),
+    )
 }
 
 /// `reims-ctl usb`: this host's USB devices, or a VM's choice of them, changed by `add` and
@@ -1908,7 +1962,7 @@ fn doctor(host: Host) -> Result<i32> {
         crate::host::Os::Linux if profile.accel(host) == "kvm" && profile != Profile::Q35X86_64 => {
             let (ok, detail) = kvm_check(host, &vms);
             line(ok, "/dev/kvm", detail);
-            let (ok, detail) = usb_check(profile);
+            let (ok, detail) = usb_check(host, profile);
             line(ok, "usb", detail);
         }
         crate::host::Os::Linux if profile == Profile::Q35X86_64 => {
@@ -1968,7 +2022,7 @@ fn doctor(host: Host) -> Result<i32> {
                         .join("; ")
                 },
             );
-            let (ok, detail) = usb_check(profile);
+            let (ok, detail) = usb_check(host, profile);
             line(ok, "usb", detail);
             let (ok, detail) = desktop_check(
                 crate::host::has_screen(&Default::default()),
@@ -1978,10 +2032,14 @@ fn doctor(host: Host) -> Result<i32> {
             );
             line(ok, "desktop session", detail);
         }
-        // The Windows Hypervisor Platform, the GPUs, the sound devices and the desktop, for the
-        // x86-64 VMs Windows runs.
+        // The Windows Hypervisor Platform, the GPUs, the sound devices, USB passthrough and the
+        // desktop, for the x86-64 VMs Windows runs.
         #[cfg(windows)]
-        crate::host::Os::Windows if profile == Profile::Q35X86_64 => windows_checks(&mut line),
+        crate::host::Os::Windows if profile == Profile::Q35X86_64 => {
+            windows_checks(&mut line);
+            let (ok, detail) = usb_check(host, profile);
+            line(ok, "usb", detail);
+        }
         crate::host::Os::Linux
         | crate::host::Os::Mac
         | crate::host::Os::Windows
@@ -2551,6 +2609,77 @@ mod tests {
             "{detail}"
         );
         assert!(!kvm_line(arm, denied(), &[arm64]).0);
+    }
+
+    /// `usb --help` keeps its Linux account of the udev rule and adds, on Windows, that libusb
+    /// lists the devices other than hubs and QEMU opens one through WinUSB, installed with Zadig.
+    #[test]
+    fn usb_help_names_libusb_and_winusb_only_on_windows() {
+        use crate::host::{Arch, Os};
+        let host = |os| Host {
+            os,
+            arch: Arch::X86_64,
+        };
+        assert_eq!(usb_help(), usb_help_on(Host::current()));
+        let linux = usb_help_on(host(Os::Linux));
+        assert!(linux.contains("its port (3-2.1)"), "{linux}");
+        assert!(linux.contains(crate::usb::UDEV_RULE_FILE));
+        assert!(linux.contains(crate::usb::UDEV_RULE));
+        assert!(
+            !linux.contains("WinUSB") && !linux.contains("libusb"),
+            "{linux}"
+        );
+        let windows = usb_help_on(host(Os::Windows));
+        assert!(
+            windows.contains("lists this host's devices with libusb, other than hubs"),
+            "{windows}"
+        );
+        assert!(windows.contains("WinUSB"), "{windows}");
+        assert!(
+            windows.contains("Zadig (https://zadig.akeo.ie/)"),
+            "{windows}"
+        );
+        assert!(!windows.contains(crate::usb::UDEV_RULE_FILE));
+    }
+
+    /// doctor says a device it cannot open needs WinUSB on Windows, and only fails where a VM is
+    /// given USB devices; Linux keeps the usb module's udev-rule answer unchanged.
+    #[test]
+    fn doctor_names_winusb_and_zadig_for_devices_it_cannot_open() {
+        use crate::host::{Arch, Os};
+        let host = |os| Host {
+            os,
+            arch: Arch::X86_64,
+        };
+        let closed = vec!["1050:0407".to_string(), "046d:c52b".to_string()];
+        let (ok, detail) = usb_unopenable(host(Os::Windows), 3, &closed, false, "udev rule");
+        assert!(ok, "{detail}");
+        assert!(
+            detail.starts_with(
+                "you can't open 2 of the 3 devices plugged in (1050:0407, 046d:c52b):"
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("libusb") && detail.contains("WinUSB"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Zadig (https://zadig.akeo.ie/)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("udev rule"), "{detail}");
+        let (ok, _) = usb_unopenable(host(Os::Windows), 3, &closed, true, "udev rule");
+        assert!(!ok);
+        let (ok, detail) = usb_unopenable(
+            host(Os::Linux),
+            1,
+            &["/dev/bus/usb/001/002".to_string()],
+            false,
+            "the udev rule",
+        );
+        assert!(ok && detail.ends_with("the udev rule"), "{detail}");
+        assert!(!detail.contains("Zadig"), "{detail}");
     }
 
     #[test]

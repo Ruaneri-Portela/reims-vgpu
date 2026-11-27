@@ -455,6 +455,9 @@ fi
 if [[ $WINDOWS == 1 && $SKIP_HOST_CHECKS == 0 ]]; then
   whp="$(powershell -NoProfile -Command "(Get-CimInstance Win32_OptionalFeature -Filter \"Name='HypervisorPlatform'\").InstallState" 2>/dev/null | tr -d '\r')"
   [[ $whp == 1 ]] || warn "the Windows Hypervisor Platform is off, and VMs run on it: turn it on in Windows Features (run optionalfeatures, tick Windows Hypervisor Platform), then restart Windows"
+  # USB passthrough (reims-ctl usb): libusb lists the host's devices, other than hubs, and QEMU's
+  # usb-host opens one through WinUSB. The driver is per device and this install cannot switch it.
+  say "A VM can be given a USB device once its driver is WinUSB, which libusb and QEMU's usb-host use: switch it with Zadig (https://zadig.akeo.ie/); reims-ctl usb --help says more"
 fi
 # Linux's checks are for the VMs it runs: KVM, the library's GPU access to the
 # guest's memory, and USB passthrough. KVM runs x86-64 VMs on x86-64 and arm64

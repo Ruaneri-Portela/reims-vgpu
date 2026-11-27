@@ -1846,6 +1846,27 @@ drawn in its first rows):
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
 
+### Windows hosts: USB passthrough
+
+An x86-64 VM on Windows takes the host's USB devices through the same
+`usb-host` devices on `qemu-xhci`, with the same arguments shown above:
+QEMU's command does not differ from Linux's. reims-ctl lists the host's
+devices with libusb, leaving out hubs, and names one by its IDs, its libusb
+port or a word of its name.
+
+libusb opens a device on Windows through WinUSB, which QEMU's `usb-host`
+uses too: before a VM can take one, its driver must be switched to WinUSB
+with Zadig (https://zadig.akeo.ie/), for each device. reims-ctl checks the
+driver service SetupAPI reports and opens only devices whose driver is
+WinUSB; libusbK and libusb-win32 are not accepted, though libusb can open
+them. `reims-ctl usb --help` says this, and `reims-ctl doctor` names the
+devices it cannot open. The install's package list already includes libusb
+for the build; it does not switch any device's driver.
+
+The arguments and the driver requirement above are **read** from reims-ctl
+and libusb; a guest driving a device passed through on a Windows host is
+**unknown** here, with no such boot measured.
+
 ### x86-64 macOS guests: sleep
 
 Give an x86-64 macOS guest no ACPI S3:

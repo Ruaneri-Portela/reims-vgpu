@@ -31,6 +31,9 @@ mod testenv;
 mod tui;
 mod update;
 mod usb;
+mod usb_libusb;
+#[cfg(windows)]
+mod usb_winusb;
 mod view;
 mod vm;
 

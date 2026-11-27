@@ -1356,6 +1356,22 @@ mod tests {
         assert!(kernel_problem((8, 0)).is_none());
     }
 
+    /// The usb module's host check, which a start uses for a VM given devices, allows an x86-64
+    /// VM on Windows as on Linux: libusb lists devices on both, and QEMU opens them through
+    /// WinUSB there. Only the arm64 VMs a Mac runs are refused.
+    #[test]
+    fn usb_devices_are_allowed_for_an_x86_64_vm_on_windows() {
+        use crate::host::Arch;
+        let host = |os, arch| Host { os, arch };
+        assert!(crate::usb::available(host(Os::Windows, Arch::X86_64)).is_ok());
+        assert!(crate::usb::available(host(Os::Linux, Arch::X86_64)).is_ok());
+        assert!(crate::usb::available(host(Os::Linux, Arch::Aarch64)).is_ok());
+        assert_eq!(
+            crate::usb::available(host(Os::Mac, Arch::Aarch64)),
+            Err(crate::usb::LINUX_ONLY)
+        );
+    }
+
     /// A stop waits for QEMU to end after `quit` about twice the longest it was measured to take
     /// on the host's OS, and 10 s at least, before it ends QEMU: 15 s on Windows, where QEMU took
     /// 28.1 s, fails the rule, and 60 s follows it.

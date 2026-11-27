@@ -1,5 +1,5 @@
 //! USB passthrough: the host's USB devices a VM's guest is given, through QEMU's `usb-host` on
-//! the VM's xHCI controller ([`bus`]), on Linux hosts, to x86-64 and arm64 VMs alike.
+//! the VM's xHCI controller ([`bus`]), to x86-64 and arm64 VMs alike.
 //!
 //! - A chosen device is kept in the VM's settings ([`UsbDevice`], a `[[usb]]` table) by its
 //!   vendor and product IDs, which follow it from port to port. One chosen while the host has
@@ -19,12 +19,17 @@
 //!   and as it lets go of the device, except for Apple's iOS devices ([`never_reset`]): a reset
 //!   makes an iPhone leave the bus and come back as a new device, and either reset, on top of the
 //!   mode switch macOS asks of it, drove it off the bus until it was plugged in again.
-//! - QEMU opens the device's file, `/dev/bus/usb/BBB/DDD`, which only root may write unless a
-//!   udev rule says otherwise: scripts/install-ctl.sh adds one ([`UDEV_RULE`]), which gives USB
-//!   devices other than hubs to the kvm group and to the user at the host's screen.
+//! - [`host_devices`] lists the host's devices, leaving hubs out as QEMU does. On Linux it reads
+//!   sysfs (`/sys/bus/usb/devices`) and lsusb's `usb.ids`; on Windows and macOS, where sysfs is
+//!   absent, it uses libusb. On Linux, QEMU opens the device's file, `/dev/bus/usb/BBB/DDD`, which
+//!   only root may write unless a udev rule says otherwise: scripts/install-ctl.sh adds one
+//!   ([`UDEV_RULE`]), which gives USB devices other than hubs to the kvm group and to the user at
+//!   the host's screen. On Windows the device's driver must first be switched to WinUSB with Zadig.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::{UsbDevice, Vm, parse_usb_port};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+use crate::vm::parse_usb_port;
+use crate::vm::{UsbDevice, Vm};
 use crate::{qmp, runtime};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -39,7 +44,9 @@ pub const UDEV_RULE_FILE: &str = "/etc/udev/rules.d/70-reims-ctl-usb.rules";
 pub const UDEV_RULE: &str = r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess""#;
 
 /// Where Linux lists the host's USB devices, and lsusb's names for them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const SYSFS: &str = "/sys/bus/usb/devices";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USB_IDS: &str = "/usr/share/hwdata/usb.ids";
 
 /// A USB device plugged into the host, other than a hub.
@@ -64,15 +71,23 @@ impl HostDevice {
         format!("{:04x}:{:04x}", self.vendor, self.product)
     }
 
-    /// The file QEMU opens it by.
+    /// The file QEMU opens it by on Linux, which the udev rule gives this user access to.
     pub fn file(&self) -> PathBuf {
         PathBuf::from(format!("/dev/bus/usb/{:03}/{:03}", self.bus, self.address))
     }
 
-    /// Whether this process may open its file to drive it, as QEMU, which runs as this user,
-    /// opens it.
+    /// Whether this process may drive it, as QEMU, which runs as this user, does: on Linux by
+    /// opening its file, which the udev rule allows; elsewhere by opening it with libusb, which on
+    /// Windows needs the WinUSB driver Zadig installs.
     pub fn usable(&self) -> bool {
-        crate::os::may_read_write(&self.file())
+        #[cfg(target_os = "linux")]
+        {
+            crate::os::may_read_write(&self.file())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            crate::usb_libusb::is_usable(self.bus, self.address, self.vendor, self.product)
+        }
     }
 
     /// Whether `u` names it.
@@ -82,21 +97,29 @@ impl HostDevice {
     }
 }
 
-/// The USB devices plugged into the host, other than hubs, by bus and port; none on a host
-/// that has no Linux sysfs.
+/// The USB devices plugged into the host, other than hubs, by bus and port. On Linux from sysfs
+/// and lsusb's `usb.ids`; elsewhere, where sysfs is absent, from libusb.
 pub fn host_devices() -> Vec<HostDevice> {
-    // Read once, where a device first needs it: the interface's view rescans every second.
-    static IDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    read_devices(Path::new(SYSFS), || {
-        IDS.get_or_init(|| {
-            String::from_utf8_lossy(&std::fs::read(USB_IDS).unwrap_or_default()).into_owned()
+    #[cfg(target_os = "linux")]
+    {
+        // Read once, where a device first needs it: the interface's view rescans every second.
+        static IDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        read_devices(Path::new(SYSFS), || {
+            IDS.get_or_init(|| {
+                String::from_utf8_lossy(&std::fs::read(USB_IDS).unwrap_or_default()).into_owned()
+            })
         })
-    })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::usb_libusb::host_devices()
+    }
 }
 
 /// The devices under `sysfs` (Linux's `/sys/bus/usb/devices`, where every device and interface
 /// has an entry), named from lsusb's `usb.ids`, which `usb_ids` gives, where a device gives no
 /// name of its own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_devices<'a>(sysfs: &Path, usb_ids: impl Fn() -> &'a str) -> Vec<HostDevice> {
     let Ok(dir) = std::fs::read_dir(sysfs) else {
         return Vec::new();
@@ -161,6 +184,7 @@ fn read_devices<'a>(sysfs: &Path, usb_ids: impl Fn() -> &'a str) -> Vec<HostDevi
 }
 
 /// A port's place among its bus's: by bus, then port by port.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn port_order(port: &str) -> Vec<u32> {
     port.split(['-', '.'])
         .map(|n| n.parse().unwrap_or(u32::MAX))
@@ -169,7 +193,7 @@ fn port_order(port: &str) -> Vec<u32> {
 
 /// A device's name from its own strings: its product, after its maker where the product does
 /// not name it.
-fn name_of(manufacturer: Option<String>, product: Option<String>) -> Option<String> {
+pub(crate) fn name_of(manufacturer: Option<String>, product: Option<String>) -> Option<String> {
     let product = product?;
     let named = |m: &str| {
         let first = m.split([' ', ',']).next().unwrap_or(m).to_ascii_lowercase();
@@ -183,7 +207,8 @@ fn name_of(manufacturer: Option<String>, product: Option<String>) -> Option<Stri
 
 /// lsusb's name for a device in `usb.ids`: its vendor's line, `vvvv  Name`, then the product's
 /// line under it, a tab before `pppp  Name`.
-fn usb_ids_name(ids: &str, vendor: u16, product: u16) -> Option<String> {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn usb_ids_name(ids: &str, vendor: u16, product: u16) -> Option<String> {
     let v = format!("{vendor:04x}  ");
     let p = format!("\t{product:04x}  ");
     let mut lines = ids.lines().skip_while(|l| !l.starts_with(&v));
@@ -200,6 +225,7 @@ fn usb_ids_name(ids: &str, vendor: u16, product: u16) -> Option<String> {
 
 /// What an interface says its device is, by its class, subclass and protocol (USB-IF's class
 /// codes), or by the network or Bluetooth device Linux made of it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn interface_kinds(dir: &Path) -> Vec<&'static str> {
     let hex = |f: &str| {
         std::fs::read_to_string(dir.join(f))
@@ -374,7 +400,7 @@ pub fn qemu_id(u: &UsbDevice) -> String {
 pub const LINUX_ONLY: &str = "USB passthrough is for VMs on Linux hosts";
 
 /// Whether this host's VMs can be given its USB devices: where they run, on Linux. x86-64 VMs on
-/// Windows are not refused, as before, though `host_devices` lists none there. Else why not.
+/// Windows are not refused, though libusb lists their devices there too. Else why not.
 pub fn available(host: Host) -> Result<(), &'static str> {
     match host.default_profile() {
         None => Err(crate::host::UNSUPPORTED),
@@ -525,22 +551,36 @@ pub fn apply(
 
 /// Why `d` can't be opened, and what lets QEMU open it.
 pub fn unusable(d: &HostDevice) -> String {
-    format!("you can't open {}: {}", d.file().display(), fix())
+    #[cfg(target_os = "linux")]
+    let device = d.file().display().to_string();
+    #[cfg(not(target_os = "linux"))]
+    let device = format!("{} at {}", d.id(), d.port);
+    format!("you can't open {device}: {}", fix())
 }
 
-/// What lets QEMU, as this user, open USB devices: the udev rule the install adds, or, where it
-/// is there, the kvm group it gives them to.
+/// What lets libusb and QEMU's `usb-host` open USB devices: on Windows the WinUSB driver Zadig
+/// installs; on Linux the udev rule the install adds, or, where it is there, the kvm group it gives
+/// them to.
 pub fn fix() -> String {
-    if Path::new(UDEV_RULE_FILE).exists() {
-        "the udev rule reims-ctl's install added gives USB devices to the kvm group and to \
-         whoever is at this host's screen: add yourself to kvm (sudo usermod -aG kvm $USER) and \
-         log in again"
+    #[cfg(windows)]
+    {
+        "switch the device's driver to WinUSB with Zadig (https://zadig.akeo.ie/), which lets \
+         libusb and QEMU's usb-host open it"
             .into()
-    } else {
-        format!(
-            "run reims-ctl update, whose install adds the udev rule {UDEV_RULE_FILE} for USB \
-             devices (reims-ctl usb --help shows it)"
-        )
+    }
+    #[cfg(not(windows))]
+    {
+        if Path::new(UDEV_RULE_FILE).exists() {
+            "the udev rule reims-ctl's install added gives USB devices to the kvm group and to \
+             whoever is at this host's screen: add yourself to kvm (sudo usermod -aG kvm $USER) and \
+             log in again"
+                .into()
+        } else {
+            format!(
+                "run reims-ctl update, whose install adds the udev rule {UDEV_RULE_FILE} for USB \
+                 devices (reims-ctl usb --help shows it)"
+            )
+        }
     }
 }
 

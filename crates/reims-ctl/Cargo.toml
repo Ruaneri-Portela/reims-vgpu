@@ -22,6 +22,10 @@ flate2 = "1.1.10"
 plist = "1.10.1"
 # The viewer's frames for the kitty and iTerm2 image protocols (view/encode.rs).
 png = "0.18.1"
+# The host's USB devices (usb.rs): libusb lists them and reads their names on every OS, and QEMU's
+# usb-host uses it to give one to a guest. `vendored` builds libusb here, so the installer needs no
+# separate libusb runtime; on Windows libusb talks to a device through WinUSB (Zadig).
+rusb = { version = "0.9.4", features = ["vendored"] }
 ratatui = "0.30.2"
 # Restores an arm64 VM's macOS from an IPSW (restore.rs): this repository's crate, its own
 # workspace.
@@ -51,6 +55,9 @@ libc = "0.2.190"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Wdk_System_Threading",
+    # Reads a USB device's driver service with SetupAPI, so a device is used only in WinUSB mode.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Usb",
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Networking_WinSock",
